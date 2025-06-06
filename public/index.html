@@ -20,15 +20,12 @@
   </head>
   <body>
     <h1>Simple Video Call</h1>
-    <video id="localVideo" autoplay muted playsinline></video>
-    <video id="remoteVideo" autoplay playsinline></video>
-
+    <div id="videos"></div>
     <div id="controls">
       <button id="toggleVideo">Turn Camera Off</button>
       <button id="toggleAudio">Mute</button>
       <button id="disconnect">Disconnect Call</button>
       <button id="shareScreen">Share Screen</button>
-      <!-- New button for screen sharing -->
     </div>
     <div
       id="callStatus"
@@ -39,28 +36,26 @@
     <script>
       const socket = io();
 
-      const localVideo = document.getElementById("localVideo");
-      const remoteVideo = document.getElementById("remoteVideo");
+      const videosContainer = document.getElementById("videos");
       const toggleVideoBtn = document.getElementById("toggleVideo");
       const toggleAudioBtn = document.getElementById("toggleAudio");
       const disconnectBtn = document.getElementById("disconnect");
       const callStatus = document.getElementById("callStatus");
-      const shareScreenBtn = document.getElementById("shareScreen"); // Share screen button
+      const shareScreenBtn = document.getElementById("shareScreen");
 
       let localStream;
-      let peerConnection;
+      let peerConnections = {}; // Keep track of peer connections
       let roomId;
-      let screenStream; // Variable to store screen stream
-      let isScreenSharing = false; // Flag to track if screen sharing is enabled
+      let screenStream;
+      let isScreenSharing = false;
 
       const configuration = {
         iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
       };
 
-      // Initialize media and set constraints for mobile
+      // Initialize media
       async function initMedia() {
         try {
-          // Set lower resolution for mobile devices
           const constraints = {
             video: {
               width: { ideal: 1280 },
@@ -70,7 +65,12 @@
           };
 
           localStream = await navigator.mediaDevices.getUserMedia(constraints);
+          const localVideo = document.createElement("video");
           localVideo.srcObject = localStream;
+          localVideo.autoplay = true;
+          localVideo.muted = true;
+          localVideo.playsinline = true;
+          videosContainer.appendChild(localVideo);
         } catch (e) {
           alert("Could not get user media");
           console.error(e);
@@ -82,30 +82,32 @@
       roomId = prompt("Enter room ID:");
       socket.emit("join-room", roomId);
 
+      // Handle when another user connects to the room
       socket.on("user-connected", (userId) => {
         console.log("User connected:", userId);
-        callUser(userId);
+        createPeerConnection(userId);
       });
 
+      // Handle signaling (offer, answer, candidate)
       socket.on("signal", async ({ id, signal }) => {
-        if (!peerConnection) {
-          createPeerConnection();
+        if (!peerConnections[id]) {
+          createPeerConnection(id);
         }
 
         if (signal.type === "offer") {
-          await peerConnection.setRemoteDescription(
+          await peerConnections[id].setRemoteDescription(
             new RTCSessionDescription(signal)
           );
-          const answer = await peerConnection.createAnswer();
-          await peerConnection.setLocalDescription(answer);
-          socket.emit("signal", peerConnection.localDescription);
+          const answer = await peerConnections[id].createAnswer();
+          await peerConnections[id].setLocalDescription(answer);
+          socket.emit("signal", peerConnections[id].localDescription);
         } else if (signal.type === "answer") {
-          await peerConnection.setRemoteDescription(
+          await peerConnections[id].setRemoteDescription(
             new RTCSessionDescription(signal)
           );
         } else if (signal.candidate) {
           try {
-            await peerConnection.addIceCandidate(
+            await peerConnections[id].addIceCandidate(
               new RTCIceCandidate(signal.candidate)
             );
           } catch (e) {
@@ -114,13 +116,16 @@
         }
       });
 
+      // Handle when another user disconnects
       socket.on("user-disconnected", (userId) => {
         console.log("User disconnected:", userId);
-        endCall();
+        endCall(userId);
       });
 
-      function createPeerConnection() {
-        peerConnection = new RTCPeerConnection(configuration);
+      // Create a new peer connection for a user
+      function createPeerConnection(userId) {
+        const peerConnection = new RTCPeerConnection(configuration);
+        peerConnections[userId] = peerConnection;
 
         peerConnection.onicecandidate = (event) => {
           if (event.candidate) {
@@ -129,20 +134,28 @@
         };
 
         peerConnection.ontrack = (event) => {
-          console.log("Received remote track:", event);
+          const remoteVideo = document.createElement("video");
           remoteVideo.srcObject = event.streams[0];
+          remoteVideo.autoplay = true;
+          remoteVideo.playsinline = true;
+          videosContainer.appendChild(remoteVideo);
         };
 
-        // Use the screen or video stream for the peer connection
+        // Add the local stream to the peer connection
         const streamToAdd = isScreenSharing ? screenStream : localStream;
         streamToAdd.getTracks().forEach((track) => {
-          console.log("Adding track:", track);
           peerConnection.addTrack(track, streamToAdd);
         });
+
+        // If this is the first user (offer), create the offer
+        if (Object.keys(peerConnections).length === 1) {
+          createOffer(userId);
+        }
       }
 
-      async function callUser(userId) {
-        createPeerConnection();
+      // Create an offer to initiate connection with a new user
+      async function createOffer(userId) {
+        const peerConnection = peerConnections[userId];
         const offer = await peerConnection.createOffer();
         await peerConnection.setLocalDescription(offer);
         socket.emit("signal", peerConnection.localDescription);
@@ -180,33 +193,20 @@
         endCall();
       };
 
-      // End the call
-      function endCall() {
-        // Stop remote video
-        if (remoteVideo.srcObject) {
-          remoteVideo.srcObject.getTracks().forEach((track) => track.stop());
-        }
-        remoteVideo.srcObject = null;
-
-        // Close peer connection
-        if (peerConnection) {
-          peerConnection.close();
-          peerConnection = null;
+      // End the call for a specific user
+      function endCall(userId) {
+        if (userId) {
+          peerConnections[userId].close();
+          delete peerConnections[userId];
         }
 
-        // Stop local media
-        if (localStream) {
-          localStream.getTracks().forEach((track) => track.stop());
+        // If there are no active peer connections, disconnect the call
+        if (Object.keys(peerConnections).length === 0) {
+          callStatus.textContent = "Call Disconnected";
+          toggleAudioBtn.disabled = true;
+          toggleVideoBtn.disabled = true;
+          shareScreenBtn.disabled = true;
         }
-        localVideo.srcObject = null;
-
-        // Show disconnect message
-        callStatus.textContent = "Call Disconnected";
-
-        // Optionally disable controls
-        toggleAudioBtn.disabled = true;
-        toggleVideoBtn.disabled = true;
-        shareScreenBtn.disabled = true; // Disable screen sharing button
       }
 
       // Start/stop screen sharing
@@ -220,15 +220,12 @@
 
       async function startScreenSharing() {
         try {
-          const isMobile = /iPhone|iPad|iPod|Android/i.test(
-            navigator.userAgent
-          );
+          const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
           if (isMobile) {
             alert("Screen sharing is not supported on mobile browsers.");
             return;
           }
 
-          // Get the screen stream
           screenStream = await navigator.mediaDevices.getDisplayMedia({
             video: true,
           });
@@ -239,13 +236,13 @@
           shareScreenBtn.textContent = "Stop Sharing Screen";
 
           // Replace the video track for all peer connections
-          if (peerConnection) {
+          Object.values(peerConnections).forEach((peerConnection) => {
             peerConnection.getSenders().forEach((sender) => {
               if (sender.track.kind === "video") {
                 sender.replaceTrack(screenStream.getVideoTracks()[0]);
               }
             });
-          }
+          });
         } catch (err) {
           alert("Could not share screen");
           console.error("Error sharing screen:", err);
@@ -262,13 +259,13 @@
         shareScreenBtn.textContent = "Share Screen";
 
         // Replace the video track for all peer connections with the local camera video
-        if (peerConnection) {
+        Object.values(peerConnections).forEach((peerConnection) => {
           peerConnection.getSenders().forEach((sender) => {
             if (sender.track.kind === "video") {
               sender.replaceTrack(localStream.getVideoTracks()[0]);
             }
           });
-        }
+        });
       }
     </script>
   </body>
